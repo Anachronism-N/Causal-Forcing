@@ -3,10 +3,11 @@ from einops import rearrange
 from torch import nn
 import torch.distributed as dist
 import torch
+import torch.nn.functional as TF_func
 
 from pipeline import SelfForcingTrainingPipeline,TeacherForcingTrainingPipeline,BidirectionalTrainingPipeline
 from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder
 
 
 class BaseModel(nn.Module):
@@ -25,8 +26,19 @@ class BaseModel(nn.Module):
                 
     def _initialize_models(self, args, device):
         
-        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
-        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        self.i2v = getattr(args, "i2v", False)
+        
+        # I2V 模式下：教师(real_score)=14B I2V，学生(fake_score)=1.3B I2V
+        # T2V 模式下：均使用 T2V-1.3B
+        if self.i2v:
+            default_real_name = "Wan2.1-I2V-14B-720P"
+            default_fake_name = "Wan2.1-Fun-1.3B-InP"
+        else:
+            default_real_name = "Wan2.1-T2V-1.3B"
+            default_fake_name = "Wan2.1-T2V-1.3B"
+        
+        self.real_model_name = getattr(args, "real_name", default_real_name)
+        self.fake_model_name = getattr(args, "fake_name", default_fake_name)
         self.iscausal = getattr(args, "causal", True)
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=self.iscausal)
         self.generator.model.requires_grad_(True)
@@ -42,6 +54,15 @@ class BaseModel(nn.Module):
 
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
+
+        # I2V: 初始化 CLIP 编码器
+        # CLIP 权重优先从 real_model (14B I2V) 目录加载，也支持通过 clip_model_dir 覆盖
+        if self.i2v:
+            clip_model_dir = getattr(args, "clip_model_dir", f"wan_models/{self.real_model_name}")
+            self.clip_encoder = WanCLIPEncoder(model_dir=clip_model_dir)
+            self.clip_encoder.requires_grad_(False)
+        else:
+            self.clip_encoder = None
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
@@ -94,6 +115,72 @@ class BaseModel(nn.Module):
                 timestep[:, :, 1:] = timestep[:, :, 0:1]
                 timestep = timestep.reshape(timestep.shape[0], -1)
             return timestep
+
+    @torch.no_grad()
+    def encode_i2v_conditions(
+        self,
+        ref_image: torch.Tensor,
+        image_or_video_shape: list,
+        batch_size: int
+    ) -> Tuple[torch.Tensor, list]:
+        """通用 I2V 条件编码方法：编码 CLIP 特征 + 构造 y (mask + image_latent)。
+        
+        对齐 Wan2.1 I2V 官方实现：y = concat(mask[4ch], image_latent[16ch]) = 20ch
+        in_dim = 36 = 16 (x) + 20 (y)
+        
+        Args:
+            ref_image: [B, C, H, W]，参考图像，值域 [-1, 1]
+            image_or_video_shape: [B, F, C, H, W] 形状列表
+            batch_size: batch 大小
+            
+        Returns:
+            clip_fea: [B, 257, 1280] — CLIP 视觉特征
+            y_list: list of [20, F_lat, lat_h, lat_w] — I2V 条件
+        """
+        assert self.clip_encoder is not None, "CLIP 编码器未初始化，请确保 i2v=True"
+        
+        ref_image = ref_image.to(device=self.device, dtype=self.dtype)
+        clip_fea = self.clip_encoder(ref_image)  # [B, 257, 1280]
+        
+        lat_h, lat_w = image_or_video_shape[3], image_or_video_shape[4]
+        num_latent_frames = image_or_video_shape[1]
+        F_pixel = (num_latent_frames - 1) * 4 + 1  # 像素帧数
+        H_pixel = lat_h * 8  # VAE spatial stride
+        W_pixel = lat_w * 8
+        
+        ref_resized = TF_func.interpolate(
+            ref_image, size=(H_pixel, W_pixel), mode='bicubic')  # [B, 3, H, W]
+        
+        y_list = []
+        for b in range(batch_size):
+            # 构造视频帧序列: [3, F_pixel, H, W]
+            video_frames = torch.zeros(
+                3, F_pixel, H_pixel, W_pixel,
+                device=self.device, dtype=self.dtype)
+            video_frames[:, 0] = ref_resized[b]  # 第一帧是参考图
+            
+            # VAE 编码: [3, F_pixel, H, W] -> [16, F_lat, lat_h, lat_w]
+            img_latent = self.vae.model.encode(
+                video_frames.unsqueeze(0),
+                [self.vae.mean.to(device=self.device, dtype=self.dtype),
+                 (1.0 / self.vae.std).to(device=self.device, dtype=self.dtype)]
+            ).float().squeeze(0)  # [16, F_lat, lat_h, lat_w]
+            
+            # 构造 mask: 对齐官方实现
+            msk = torch.ones(1, F_pixel, lat_h, lat_w, device=self.device, dtype=self.dtype)
+            msk[:, 1:] = 0
+            msk = torch.concat([
+                torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),
+                msk[:, 1:]
+            ], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, F_lat, lat_h, lat_w]
+            
+            # y = concat(mask[4ch], latent[16ch]) = [20, F_lat, lat_h, lat_w]
+            y_i = torch.concat([msk, img_latent])
+            y_list.append(y_i)
+        
+        return clip_fea, y_list
 
 
 class SelfForcingModel(BaseModel):

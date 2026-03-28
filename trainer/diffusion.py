@@ -72,7 +72,12 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # I2V: 将 CLIP 编码器移到 GPU
+        if self.model.clip_encoder is not None:
+            self.model.clip_encoder = self.model.clip_encoder.to(
+                device=self.device, dtype=self.dtype)
+
+        if not config.no_visualize or config.load_raw_video or getattr(config, 'i2v', False):
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -154,6 +159,8 @@ class Trainer:
         self.max_grad_norm = 10.0
         self.previous_time = None
         self.delta_mean = None
+        self.loss_ema = None  # loss 移动平均
+        self.loss_ema_decay = 0.99
         self.rtf_ema_ratio = getattr(self.config, "rtf_ema_ratio", 0.9) 
         self.eval_interval = getattr(self.config, "eval_interval", 0)      # 0 => disable
         self.eval_frames = getattr(self.config, "eval_num_output_frames", 21)
@@ -190,6 +197,7 @@ class Trainer:
 
     def train_one_step(self, batch):
         self.log_iters = 1
+        step_start_time = time.time()
 
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
@@ -225,6 +233,31 @@ class Trainer:
             else:
                 unconditional_dict = self.unconditional_dict
 
+            # I2V: 编码 CLIP 特征并构造 y
+            if getattr(self.config, 'i2v', False) and self.model.clip_encoder is not None:
+                ref_image = batch.get("image", None)
+                if ref_image is not None:
+                    ref_image = ref_image.to(device=self.device, dtype=self.dtype)
+                else:
+                    # LatentLMDBDataset 没有 image 字段，从 clean_latent 首帧解码获取参考图
+                    first_frame_latent = clean_latent[:, 0:1]  # [B, 1, C, H, W]
+                    first_frame_pixel = self.model.vae.decode_to_pixel(
+                        first_frame_latent).to(self.dtype)  # [B, 1, 3, H, W]
+                    ref_image = first_frame_pixel[:, 0]  # [B, 3, H, W]
+                
+                clip_fea, y_list = self.model.encode_i2v_conditions(
+                    ref_image=ref_image,
+                    image_or_video_shape=image_or_video_shape,
+                    batch_size=batch_size
+                )
+                conditional_dict["clip_fea"] = clip_fea
+                conditional_dict["y"] = y_list
+                unconditional_dict["clip_fea"] = clip_fea
+                unconditional_dict["y"] = y_list
+
+        if self.is_main_process and self.step % 10 == 0:
+            print(f"[train_one_step] step={self.step}, conditions encoded, starting generator forward...", flush=True)
+
         # Step 3: Train the generator
         generator_loss, log_dict = self.model.generator_loss(
             image_or_video_shape=image_or_video_shape,
@@ -242,9 +275,34 @@ class Trainer:
         # Increment the step since we finished gradient update
         self.step += 1
 
+        # 计算 loss 移动平均
+        cur_loss = generator_loss.item()
+        if self.loss_ema is None:
+            self.loss_ema = cur_loss
+        else:
+            self.loss_ema = self.loss_ema_decay * self.loss_ema + (1 - self.loss_ema_decay) * cur_loss
+
+        step_elapsed = time.time() - step_start_time
+
+        if self.is_main_process and (self.step <= 5 or self.step % 10 == 0):
+            gpu_mem_alloc = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+            gpu_mem_reserved = torch.cuda.max_memory_reserved(self.device) / (1024 ** 3)
+            lr_current = self.generator_optimizer.param_groups[0]['lr']
+            print(
+                f"[step {self.step:>6d}] "
+                f"loss={cur_loss:.6f} | loss_ema={self.loss_ema:.6f} | "
+                f"grad_norm={generator_grad_norm.item():.4f} | "
+                f"lr={lr_current:.2e} | "
+                f"step_time={step_elapsed:.2f}s | "
+                f"GPU_mem={gpu_mem_alloc:.1f}GB/{gpu_mem_reserved:.1f}GB",
+                flush=True
+            )
+
         wandb_loss_dict = {
-            "generator_loss": generator_loss.item(),
+            "generator_loss": cur_loss,
             "generator_grad_norm": generator_grad_norm.item(),
+            "loss_ema": self.loss_ema,
+            "step_time": step_elapsed,
         }
 
         # Step 4: Logging
@@ -259,6 +317,24 @@ class Trainer:
 
 
     def train(self):
+        if self.is_main_process:
+            print("=" * 70, flush=True)
+            print("[train] 训练配置摘要:", flush=True)
+            print(f"  trainer:              {self.config.trainer}", flush=True)
+            print(f"  i2v:                  {getattr(self.config, 'i2v', False)}", flush=True)
+            print(f"  num_frame_per_block:  {getattr(self.config, 'num_frame_per_block', 'N/A')}", flush=True)
+            print(f"  teacher_forcing:      {getattr(self.config, 'teacher_forcing', False)}", flush=True)
+            print(f"  lr:                   {self.config.lr}", flush=True)
+            print(f"  batch_size:           {self.config.batch_size} (total: {getattr(self.config, 'total_batch_size', 'N/A')})", flush=True)
+            print(f"  mixed_precision:      {self.config.mixed_precision}", flush=True)
+            print(f"  dataset_size:         {len(self.dataset)}", flush=True)
+            print(f"  save_interval:        {self.config.log_iters}", flush=True)
+            print(f"  output_path:          {self.output_path}", flush=True)
+            print(f"  world_size:           {dist.get_world_size()}", flush=True)
+            model_name = getattr(self.config, 'model_kwargs', {}).get('model_name', 'N/A')
+            print(f"  model_name:           {model_name}", flush=True)
+            print("=" * 70, flush=True)
+            print("[train] Starting training loop...", flush=True)
 
         while True:
             batch = next(self.dataloader)
@@ -275,6 +351,7 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
+                    iter_time = current_time - self.previous_time
                     if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                        wandb.log({"per iteration time": iter_time}, step=self.step)
                     self.previous_time = current_time

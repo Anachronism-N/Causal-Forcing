@@ -3,7 +3,7 @@ from typing import Tuple
 import torch
 import random
 from model.base import BaseModel
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder
 from utils.scheduler import FlowMatchScheduler
 from pipeline import CausalDiffusionInferencePipeline
 class NaiveConsistency(BaseModel):
@@ -64,6 +64,8 @@ class NaiveConsistency(BaseModel):
         self.pipeline.text_encoder = self.text_encoder
         
     def _initialize_models(self, args, device):
+        self.i2v = getattr(args, "i2v", False)
+        
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
@@ -76,6 +78,19 @@ class NaiveConsistency(BaseModel):
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
 
+        self.vae = WanVAEWrapper()
+        self.vae.requires_grad_(False)
+        
+        # I2V: 初始化 CLIP 编码器
+        if self.i2v:
+            clip_model_dir = getattr(args, "clip_model_dir", None)
+            model_name = getattr(args, "model_kwargs", {}).get("model_name", "Wan2.1-Fun-1.3B-InP")
+            if clip_model_dir is None:
+                clip_model_dir = f"wan_models/{model_name}"
+            self.clip_encoder = WanCLIPEncoder(model_dir=clip_model_dir)
+            self.clip_encoder.requires_grad_(False)
+        else:
+            self.clip_encoder = None
         
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)

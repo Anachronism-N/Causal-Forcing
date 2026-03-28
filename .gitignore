@@ -4,5 +4,6 @@ __pycache__
 wan_models
 checkpoints
 output
+outputs
 dataset
 prompts/vidprom_filtered_extended.txt

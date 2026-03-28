@@ -325,8 +325,12 @@ class CausalWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+            if crossattn_cache is not None:
+                x = x + self.cross_attn(self.norm3(x), context,
+                                        context_lens, crossattn_cache=crossattn_cache)
+            else:
+                x = x + self.cross_attn(self.norm3(x), context,
+                                        context_lens)
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -760,7 +764,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            # 推理时 x 是逐帧/逐 block 输入的，但 y 可能是完整序列
+            # 需要根据当前帧索引对 y 进行切片，使帧维度与 x 对齐
+            frame_seq_len = x[0].shape[-2] * x[0].shape[-1] // (self.patch_size[1] * self.patch_size[2])
+            current_frame_idx = current_start // frame_seq_len if frame_seq_len > 0 else 0
+            y_sliced = []
+            for u_x, u_y in zip(x, y):
+                num_frames_x = u_x.shape[1]  # x: [C, F, H, W]
+                num_frames_y = u_y.shape[1]  # y: [C_y, F, H, W]
+                if num_frames_y > num_frames_x:
+                    u_y = u_y[:, current_frame_idx:current_frame_idx + num_frames_x]
+                y_sliced.append(u_y)
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y_sliced)]
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -795,6 +810,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ]))
 
         if clip_fea is not None:
+            # 对齐 clip_fea 的 dtype 到 img_emb 权重的 dtype，避免 Half vs BFloat16 不匹配
+            clip_fea = clip_fea.to(dtype=next(self.img_emb.parameters()).dtype)
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
@@ -951,6 +968,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         if clean_x is not None:
             # clean_x.detach()
+            # I2V: clean_x 也需要和 y 拼接，与 x 的处理保持一致
+            if y is not None:
+                clean_x = [torch.cat([u, v], dim=0) for u, v in zip(clean_x, y)]
             clean_x = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
             clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
 

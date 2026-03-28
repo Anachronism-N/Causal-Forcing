@@ -92,7 +92,14 @@ class Trainer:
             cpu_offload=True
         )
 
-        
+        # I2V: 将 CLIP 编码器和 VAE 移到 GPU
+        if self.model.clip_encoder is not None:
+            self.model.clip_encoder = self.model.clip_encoder.to(
+                device=self.device, dtype=self.dtype)
+        if getattr(config, 'i2v', False):
+            self.model.vae = self.model.vae.to(
+                device=self.device, dtype=self.dtype)
+
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
              if param.requires_grad],
@@ -228,6 +235,26 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+
+            # I2V: 编码 CLIP 特征并构造 y
+            if getattr(self.config, 'i2v', False) and self.model.clip_encoder is not None:
+                # 从 clean_latent 解码首帧作为参考图
+                if clean_latent is not None:
+                    clean_lat = clean_latent.to(device=self.device, dtype=self.dtype)
+                    first_frame_latent = clean_lat[:, 0:1]  # [B, 1, C, H, W]
+                    first_frame_pixel = self.model.vae.decode_to_pixel(
+                        first_frame_latent).to(self.dtype)  # [B, 1, 3, H, W]
+                    ref_image = first_frame_pixel[:, 0]  # [B, 3, H, W]
+                    
+                    clip_fea, y_list = self.model.encode_i2v_conditions(
+                        ref_image=ref_image,
+                        image_or_video_shape=image_or_video_shape,
+                        batch_size=batch_size
+                    )
+                    conditional_dict["clip_fea"] = clip_fea
+                    conditional_dict["y"] = y_list
+                    unconditional_dict["clip_fea"] = clip_fea
+                    unconditional_dict["y"] = y_list
 
         # Step 3: Store gradients for the generator (if training the generator)
         generator_loss, generator_log_dict = self.model.generator_loss(

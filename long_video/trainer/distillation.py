@@ -171,6 +171,7 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.max_iters = int(config.max_iters) if getattr(config, "max_iters", None) is not None else None
         self.previous_time = None
 
     def save(self):
@@ -396,3 +397,11 @@ class Trainer:
                         f"Iteration time: {current_time - self.previous_time:.2f} seconds | "
                     )
                     self.previous_time = current_time
+
+            if self.max_iters is not None and self.step >= self.max_iters:
+                should_save_final = (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters != 0
+                if should_save_final:
+                    torch.cuda.empty_cache()
+                    self.save()
+                    torch.cuda.empty_cache()
+                break

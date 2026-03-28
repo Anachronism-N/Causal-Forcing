@@ -52,7 +52,9 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
-        rectified_tf = False 
+        rectified_tf = False,
+        clip_fea: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -87,6 +89,12 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+
+        # I2V: 将 CLIP 特征和 y 条件加入 conditional_dict
+        if clip_fea is not None:
+            conditional_dict["clip_fea"] = clip_fea
+        if y is not None:
+            conditional_dict["y"] = y
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5

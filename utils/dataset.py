@@ -74,32 +74,71 @@ class ODERegressionLMDBDataset(Dataset):
 
 class LatentLMDBDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8)):
-        self.env = lmdb.open(data_path, readonly=True,
-                             lock=False, readahead=False, meminit=False)
-
-        self.latents_shape = get_array_shape_from_lmdb(self.env, 'latents')
         self.max_pair = max_pair
 
+        # 自动检测是否为分片LMDB数据（目录下包含shard_*子目录）
+        shard_dirs = sorted([
+            d for d in os.listdir(data_path)
+            if os.path.isdir(os.path.join(data_path, d))
+        ]) if os.path.isdir(data_path) else []
+
+        if shard_dirs and any(d.startswith("shard_") for d in shard_dirs):
+            # 分片模式：逐个打开shard子目录
+            self.sharding = True
+            self.envs = []
+            self.index = []  # (shard_id, local_idx)
+            self.latents_shapes = []
+
+            for fname in shard_dirs:
+                path = os.path.join(data_path, fname)
+                if not os.path.isfile(os.path.join(path, "data.mdb")):
+                    continue
+                env = lmdb.open(path, readonly=True,
+                                lock=False, readahead=False, meminit=False)
+                shard_id = len(self.envs)
+                self.envs.append(env)
+                shape = get_array_shape_from_lmdb(env, 'latents')
+                self.latents_shapes.append(shape)
+                for local_i in range(shape[0]):
+                    self.index.append((shard_id, local_i))
+        else:
+            # 单LMDB模式
+            self.sharding = False
+            self.env = lmdb.open(data_path, readonly=True,
+                                 lock=False, readahead=False, meminit=False)
+            self.latents_shape = get_array_shape_from_lmdb(self.env, 'latents')
+
     def __len__(self):
+        if self.sharding:
+            return min(len(self.index), self.max_pair)
         return min(self.latents_shape[0], self.max_pair)
 
     def __getitem__(self, idx):
         """
         Outputs:
             - prompts: List of Strings
-            - latents: Tensor of shape (num_denoising_steps, num_frames, num_channels, height, width). It is ordered from pure noise to clean image.
+            - clean_latent: Tensor of shape (num_frames, num_channels, height, width).
         """
+        if self.sharding:
+            shard_id, local_idx = self.index[idx]
+            env = self.envs[shard_id]
+            shape = self.latents_shapes[shard_id][1:]
+        else:
+            env = self.env
+            local_idx = idx
+            shape = self.latents_shape[1:]
+
         latents = retrieve_row_from_lmdb(
-            self.env,
-            "latents", np.float16, idx, shape=self.latents_shape[1:]
+            env,
+            "latents", np.float16, local_idx, shape=shape
         )
 
         if len(latents.shape) == 4:
             latents = latents[None, ...]
 
         prompts = retrieve_row_from_lmdb(
-            self.env,
-            "prompts", str, idx
+            env,
+            "prompts", str, local_idx
         )
         return {
             "prompts": prompts,
@@ -242,15 +281,20 @@ class TextImagePairDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return {
+        result = {
             'image': image,
             'prompts': item['caption'],
-            'target_bbox': item['target_crop']['target_bbox'],
-            'target_ratio': item['target_crop']['target_ratio'],
-            'type': item['type'],
-            'origin_size': (item['origin_width'], item['origin_height']),
             'idx': idx
         }
+        # 以下字段为可选，缺失时不返回
+        if 'target_crop' in item:
+            result['target_bbox'] = item['target_crop']['target_bbox']
+            result['target_ratio'] = item['target_crop']['target_ratio']
+        if 'type' in item:
+            result['type'] = item['type']
+        if 'origin_width' in item and 'origin_height' in item:
+            result['origin_size'] = (item['origin_width'], item['origin_height'])
+        return result
 
 
 

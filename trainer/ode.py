@@ -74,7 +74,12 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # I2V: 将 CLIP 编码器移到 GPU
+        if self.model.clip_encoder is not None:
+            self.model.clip_encoder = self.model.clip_encoder.to(
+                device=self.device, dtype=self.dtype)
+
+        if not config.no_visualize or config.load_raw_video or getattr(config, 'i2v', False):
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -158,6 +163,27 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts)
+
+            # I2V: 编码 CLIP 特征并构造 y
+            if getattr(self.config, 'i2v', False) and self.model.clip_encoder is not None:
+                # ODE dataset 中的 ode_latent 最后一帧是 clean latent
+                # 从中提取首帧作为参考帧（已是 latent 空间）
+                # 需要解码回 pixel 再编码 CLIP
+                clean_latent = ode_latent[:, -1]  # [B, F, C, H, W]
+                first_frame_latent = clean_latent[:, 0:1]  # [B, 1, C, H, W]
+                first_frame_pixel = self.model.vae.decode_to_pixel(
+                    first_frame_latent).to(self.dtype)  # [B, 1, 3, H, W]
+                ref_image = first_frame_pixel[:, 0]  # [B, 3, H, W]
+                
+                batch_size = ode_latent.shape[0]
+                image_or_video_shape = [batch_size, ode_latent.shape[2], *ode_latent.shape[3:]]
+                clip_fea, y_list = self.model.encode_i2v_conditions(
+                    ref_image=ref_image,
+                    image_or_video_shape=image_or_video_shape,
+                    batch_size=batch_size
+                )
+                conditional_dict["clip_fea"] = clip_fea
+                conditional_dict["y"] = y_list
 
         # Step 3: Train the generator
         generator_loss, log_dict = self.model.generator_loss(

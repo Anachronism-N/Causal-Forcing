@@ -1,0 +1,34 @@
+# Stage 2: Causal ODE Distillation (I2V)
+# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V)
+# 学生 = CausalWanModel (目标: 少步)
+# 输入: ODE trajectory pairs (预计算)
+generator_ckpt: outputs/stage1_i2v/checkpoint_model_006000/model.pt
+generator_grad:
+  model: true
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+generator_task: causal_video
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+mixed_precision: true
+seed: 42
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+log_iters: 1000
+trainer: ode
+gradient_checkpointing: true
+num_frame_per_block: 3
+# I2V 特有配置
+i2v: true
+model_kwargs:
+  model_name: Wan2.1-Fun-1.3B-InP
+  timestep_shift: 5.0
+data_path: dataset/ODE6KCausal_framewise_i2v

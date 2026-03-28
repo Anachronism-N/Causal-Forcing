@@ -2,6 +2,7 @@ import types
 from typing import List, Optional
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -9,6 +10,7 @@ from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+from wan.modules.clip import CLIPModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -110,6 +112,65 @@ class WanVAEWrapper(torch.nn.Module):
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
+
+
+class WanCLIPEncoder(torch.nn.Module):
+    """封装 CLIP 视觉编码器，用于 I2V 条件注入。
+    
+    对齐 Wan2.1 官方实现：
+    - 使用 xlm-roberta-large-ViT-H-14
+    - 输出前31层特征 (use_31_block=True)
+    - 输出 shape: [B, 257, 1280] (1 CLS + 256 patches)
+    """
+
+    def __init__(self, model_dir="wan_models/Wan2.1-I2V-14B-720P"):
+        super().__init__()
+        import os
+        self.clip = CLIPModel(
+            dtype=torch.float16,
+            device=torch.device('cpu'),  # 先加载到CPU，后续to(device)
+            checkpoint_path=os.path.join(model_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+            tokenizer_path=os.path.join(model_dir, "xlm-roberta-large")
+        )
+
+    def _sync_clip_device_dtype(self, device: torch.device, dtype: torch.dtype = None) -> None:
+        """由于 CLIPModel 不是 nn.Module，外层 .to() 不会自动递归到内部 model。
+
+        这里在真正 forward 前显式同步 device / dtype，避免出现
+        input 在 CUDA、weight 仍在 CPU 的错误。
+        """
+        target_device = torch.device(device)
+        target_dtype = dtype if dtype is not None else self.clip.dtype
+
+        current_param = next(self.clip.model.parameters())
+        if current_param.device != target_device or current_param.dtype != target_dtype:
+            self.clip.model = self.clip.model.to(device=target_device, dtype=target_dtype)
+
+        self.clip.device = target_device
+        self.clip.dtype = target_dtype
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """编码参考图像为 CLIP 特征。
+        
+        Args:
+            images: [B, C, 1, H, W] — 参考图像，值域 [-1, 1]
+                    或 [B, C, H, W] — 单帧图像
+        
+        Returns:
+            clip_fea: [B, 257, 1280] — CLIP 视觉特征
+        """
+        # 确保输入是 [B, C, 1, H, W] 格式
+        if images.dim() == 4:
+            images = images.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+
+        self._sync_clip_device_dtype(images.device, self.clip.dtype)
+        images = images.to(device=self.clip.device, dtype=self.clip.dtype)
+        
+        # CLIPModel.visual 期望输入 list of [C, T, H, W]
+        # 每个元素是一个视频片段
+        video_list = [img for img in images]  # list of [C, 1, H, W]
+        clip_fea = self.clip.visual(video_list)  # [B, 257, 1280]
+        return clip_fea
 
 
 class WanDiffusionWrapper(torch.nn.Module):
@@ -230,12 +291,29 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        # I2V 条件：CLIP 特征和 image latent (y)
+        clip_fea = conditional_dict.get("clip_fea", None)
+        y = conditional_dict.get("y", None)
 
         # [B, F] -> [B]
         if self.uniform_timestep:
             input_timestep = timestep[:, 0]
         else:
             input_timestep = timestep
+
+        # 构造 I2V 额外参数
+        # 只有当模型本身支持 I2V 时才传递 clip_fea 和 y
+        # 避免 T2V score models 收到 I2V 条件导致 channel 不匹配
+        i2v_kwargs = {}
+        model_type = getattr(self.model, 'model_type', 't2v')
+        if clip_fea is not None and model_type == 'i2v':
+            i2v_kwargs["clip_fea"] = clip_fea
+        if y is not None and model_type == 'i2v':
+            # y 需要是 list of [C_y, F, H, W]，对齐 WanModel 的输入格式
+            if isinstance(y, torch.Tensor):
+                i2v_kwargs["y"] = [u for u in y]  # batch 拆成 list
+            else:
+                i2v_kwargs["y"] = y
 
         logits = None
         # X0 prediction
@@ -247,7 +325,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                **i2v_kwargs
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -258,6 +337,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4), # => [B, C, F, H, W]
                     aug_t=aug_t,
+                    **i2v_kwargs
                 ).permute(0, 2, 1, 3, 4)
             else:
                 # diffusion forcing or bidirectional
@@ -270,14 +350,16 @@ class WanDiffusionWrapper(torch.nn.Module):
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings
+                        concat_time_embeddings=concat_time_embeddings,
+                        **i2v_kwargs
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        **i2v_kwargs
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

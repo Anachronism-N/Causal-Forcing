@@ -17,6 +17,7 @@ from pipeline import (
     CausalInferencePipeline,
 )
 from utils.dataset import TextDataset, TextImagePairDataset
+from utils.wan_wrapper import WanCLIPEncoder
 from utils.misc import set_seed
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
@@ -87,6 +88,19 @@ else:
 pipeline.generator.to(device=gpu)
 pipeline.vae.to(device=gpu)
 
+# I2V: 初始化 CLIP 编码器
+clip_encoder = None
+if args.i2v:
+    clip_model_dir = getattr(config, "clip_model_dir", None)
+    if clip_model_dir is None:
+        # 从 model_kwargs 中推断模型名
+        model_name = getattr(config, "model_kwargs", {}).get("model_name", "Wan2.1-I2V-14B-720P")
+        clip_model_dir = f"wan_models/{model_name}"
+    print(f"Loading CLIP encoder from {clip_model_dir}")
+    clip_encoder = WanCLIPEncoder(model_dir=clip_model_dir)
+    clip_encoder = clip_encoder.to(device=device, dtype=torch.bfloat16)
+    clip_encoder.eval()
+
 
 # Create dataset
 if args.i2v:
@@ -141,7 +155,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     
     
     if args.i2v:
-        assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
         # For image-to-video, batch contains image and caption
         prompt = batch['prompts'][0]  # Get caption from batch
         output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
@@ -153,10 +166,62 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
         # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
-        prompts = [prompt] 
+        prompts = [prompt]
+        num_noise_frames = args.num_output_frames - 1
+        # 自动向上对齐：确保噪声帧数能被 num_frame_per_block 整除
+        block_size = config.num_frame_per_block
+        if num_noise_frames % block_size != 0:
+            aligned_noise_frames = ((num_noise_frames + block_size - 1) // block_size) * block_size
+            print(f"[I2V] num_noise_frames {num_noise_frames} 不能被 num_frame_per_block={block_size} 整除，"
+                  f"自动对齐为 {aligned_noise_frames}（输出帧数: {aligned_noise_frames + 1}）")
+            num_noise_frames = aligned_noise_frames
         sampled_noise = torch.randn(
-            [1, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [1, num_noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
+        
+        # I2V: 编码 CLIP 条件并构造 y
+        clip_fea = None
+        y_cond = None
+        if clip_encoder is not None:
+            # image for CLIP: [B, C, H, W], 值域 [-1, 1]
+            clip_image = batch['image'].squeeze(0).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+            clip_fea = clip_encoder(clip_image)  # [B, 257, 1280]
+            
+            # 构造 y: 对齐 Wan2.1 I2V 官方实现
+            # y = concat(mask[4ch], image_latent[16ch]) = 20ch
+            num_latent_frames = num_noise_frames + 1  # F_lat（包含初始帧），使用对齐后的帧数
+            F = (num_latent_frames - 1) * 4 + 1  # 像素帧数
+            lat_h, lat_w = 60, 104
+            H_pixel, W_pixel = lat_h * 8, lat_w * 8
+            
+            # 参考图像 resize 到目标分辨率
+            ref_img = batch['image'].squeeze(0).to(device=device, dtype=torch.bfloat16)  # [C, H, W]
+            ref_resized = torch.nn.functional.interpolate(
+                ref_img.unsqueeze(0), size=(H_pixel, W_pixel), mode='bicubic').squeeze(0)  # [3, H, W]
+            
+            # 构造视频帧: [3, F, H, W], 第一帧是参考图，其余填零
+            video_frames = torch.zeros(3, F, H_pixel, W_pixel, device=device, dtype=torch.bfloat16)
+            video_frames[:, 0] = ref_resized
+            
+            # VAE 编码
+            img_latent = pipeline.vae.model.encode(
+                video_frames.unsqueeze(0),
+                [pipeline.vae.mean.to(device=device, dtype=torch.bfloat16),
+                 (1.0 / pipeline.vae.std).to(device=device, dtype=torch.bfloat16)]
+            ).to(dtype=torch.bfloat16).squeeze(0)  # [16, F_lat, lat_h, lat_w]
+            
+            # 构造 mask: 对齐官方实现 (4 channel)
+            msk = torch.ones(1, F, lat_h, lat_w, device=device, dtype=torch.bfloat16)
+            msk[:, 1:] = 0
+            msk = torch.concat([
+                torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),
+                msk[:, 1:]
+            ], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]  # [4, F_lat, lat_h, lat_w]
+            
+            # y = concat(mask[4ch], latent[16ch]) = [20, F_lat, lat_h, lat_w]
+            y_cond = [torch.concat([msk, img_latent])]  # list of [20, F_lat, H, W]
     else:
         # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
@@ -180,7 +245,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         noise=sampled_noise,
         text_prompts=prompts,
         return_latents=True,
-        initial_latent=initial_latent
+        initial_latent=initial_latent,
+        clip_fea=clip_fea if args.i2v else None,
+        y=y_cond if args.i2v else None
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

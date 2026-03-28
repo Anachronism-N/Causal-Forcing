@@ -1,6 +1,7 @@
 from datetime import timedelta
 from functools import partial
 import os
+import time
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
@@ -83,9 +84,23 @@ def launch_distributed_job(backend: str = "nccl"):
         init_method = f"tcp://[{host}]:{port}"
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
+
+    start_time = time.time()
+    print(
+        f"[{time.strftime('%F %T')}] [distributed pid={os.getpid()} rank={rank} local_rank={local_rank}] start init_process_group backend={backend} world_size={world_size} init_method={init_method}",
+        flush=True,
+    )
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
                             init_method=init_method, timeout=timedelta(minutes=30))
+    print(
+        f"[{time.strftime('%F %T')}] [distributed pid={os.getpid()} rank={rank} local_rank={local_rank}] init_process_group done in {time.time() - start_time:.2f}s",
+        flush=True,
+    )
     torch.cuda.set_device(local_rank)
+    print(
+        f"[{time.strftime('%F %T')}] [distributed pid={os.getpid()} rank={rank} local_rank={local_rank}] torch.cuda.set_device({local_rank}) done",
+        flush=True,
+    )
 
 
 class EMA_FSDP:

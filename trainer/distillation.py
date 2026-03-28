@@ -1,5 +1,6 @@
 import gc
 import logging
+import numpy as np
 from utils.dataset import cycle
 from utils.dataset import TextDataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -11,6 +12,14 @@ import torch
 import wandb
 import time
 import os
+
+
+def debug_log(message, rank=None):
+    resolved_rank = os.environ.get("RANK", "?") if rank is None else rank
+    print(
+        f"[{time.strftime('%F %T')}] [distillation pid={os.getpid()} rank={resolved_rank}] {message}",
+        flush=True,
+    )
 
 
 class Trainer:
@@ -94,7 +103,12 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # I2V: 将 CLIP 编码器移到 GPU（不需要训练，不需要 FSDP）
+        if self.model.clip_encoder is not None:
+            self.model.clip_encoder = self.model.clip_encoder.to(
+                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+
+        if not config.no_visualize or config.load_raw_video or getattr(config, 'i2v', False):
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -115,7 +129,12 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = TextDataset(config.data_path)
+        if getattr(config, 'i2v', False):
+            # I2V 模式：需要参考图像，使用 LatentLMDB 或 TextImagePair 数据集
+            from utils.dataset import LatentLMDBDataset
+            dataset = LatentLMDBDataset(config.data_path)
+        else:
+            dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -183,6 +202,7 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.max_iters = int(config.max_iters) if getattr(config, "max_iters", None) is not None else None
         self.previous_time = None
 
     def save(self):
@@ -235,11 +255,15 @@ class Trainer:
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         if self.config.i2v:
-            # clean_latent = None #original code here
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
-                device=self.device, dtype=self.dtype)
+            # I2V 模式：从 clean_latent 获取首帧作为 initial_latent
+            clean_latent_for_init = batch.get("clean_latent", None)
+            if clean_latent_for_init is not None:
+                clean_latent_for_init = clean_latent_for_init.to(
+                    device=self.device, dtype=self.dtype)
+                image_latent = clean_latent_for_init[:, 0:1, ]
+            else:
+                image_latent = None
         else:
-            # clean_latent = None #original code here
             image_latent = None
 
         batch_size = len(text_prompts)
@@ -259,6 +283,30 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+
+            # I2V: 编码 CLIP 特征并构造 y (image latent + mask)
+            if self.config.i2v and self.model.clip_encoder is not None:
+                # 从 batch 中获取参考图像
+                ref_image = batch.get("image", None)
+                if ref_image is not None:
+                    ref_image = ref_image.to(device=self.device, dtype=self.dtype)
+                elif clean_latent_for_init is not None:
+                    # 没有原始图像时，从 clean_latent 首帧解码获取
+                    first_frame_latent = clean_latent_for_init[:, 0:1]  # [B, 1, C, H, W]
+                    first_frame_pixel = self.model.vae.decode_to_pixel(
+                        first_frame_latent).to(self.dtype)  # [B, 1, 3, H, W]
+                    ref_image = first_frame_pixel[:, 0]  # [B, 3, H, W]
+                
+                if ref_image is not None:
+                    clip_fea, y_list = self.model.encode_i2v_conditions(
+                        ref_image=ref_image,
+                        image_or_video_shape=image_or_video_shape,
+                        batch_size=batch_size
+                    )
+                    conditional_dict["clip_fea"] = clip_fea
+                    conditional_dict["y"] = y_list
+                    unconditional_dict["clip_fea"] = clip_fea
+                    unconditional_dict["y"] = y_list
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -377,3 +425,11 @@ class Trainer:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            if self.max_iters is not None and self.step >= self.max_iters:
+                should_save_final = (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters != 0
+                if should_save_final:
+                    torch.cuda.empty_cache()
+                    self.save()
+                    torch.cuda.empty_cache()
+                break
