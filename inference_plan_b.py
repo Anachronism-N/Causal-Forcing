@@ -27,7 +27,7 @@ parser.add_argument("--config_path", type=str, help="Path to the config file")
 parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint folder")
 parser.add_argument("--data_path", type=str, help="Path to the dataset")
 parser.add_argument("--output_folder", type=str, help="Output folder")
-parser.add_argument("--num_output_frames", type=int, default=21, help="Number of output frames (I2V plan A: 1+4*5=21, T2V: depends on config)")
+parser.add_argument("--num_output_frames", type=int, default=21, help="Number of overlap frames between sliding windows")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
@@ -163,41 +163,18 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             continue
         prompts = [prompt]
 
+        # 方案 B：I2V 推理使用与训练完全一致的帧数（21帧），不传 initial_latent
+        # 训练时 independent_first_frame=False, num_frame_per_block=3, 总帧数=21
+        # 推理时也使用 21 帧噪声，分块 [3,3,3,3,3,3,3]，与训练完全对齐
+        num_noise_frames = args.num_output_frames  # 直接使用 21 帧噪声
         block_size = config.num_frame_per_block
-        use_independent_first_frame = getattr(config, 'independent_first_frame', False)
-
-        if use_independent_first_frame:
-            # 方案 A：I2V 推理使用 initial_latent + independent_first_frame=True
-            # 训练时 independent_first_frame=True, 首帧独立去噪
-            # 推理时传入 initial_latent（编码后的首帧），噪声帧数 = num_output_frames - 1
-            # 分块方式：initial_latent(1帧) + [4,4,4,4,4](20帧噪声) = 21帧输出
-            image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
-            initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
-
-            num_noise_frames = args.num_output_frames - 1  # 减去 initial_latent 的 1 帧
-            assert num_noise_frames % block_size == 0, (
-                f"[I2V 方案A] num_noise_frames={num_noise_frames} 必须能被 num_frame_per_block={block_size} 整除。"
-                f"请确保 (num_output_frames-1) % num_frame_per_block == 0")
-            sampled_noise = torch.randn(
-                [1, num_noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-            )
-            num_latent_frames = args.num_output_frames  # 总 latent 帧数 = initial(1) + noise
-        else:
-            # 方案 B：I2V 推理不使用 initial_latent
-            # 训练时 independent_first_frame=False, 所有帧统一去噪
-            # 推理时不传 initial_latent，I2V 条件完全通过 clip_fea + y 注入
-            # 分块方式：[3,3,3,3,3,3,3](21帧噪声) = 21帧输出
-            initial_latent = None
-
-            num_noise_frames = args.num_output_frames  # 所有帧都是噪声帧
-            assert num_noise_frames % block_size == 0, (
-                f"[I2V 方案B] num_noise_frames={num_noise_frames} 必须能被 num_frame_per_block={block_size} 整除。"
-                f"请确保 num_output_frames % num_frame_per_block == 0")
-            sampled_noise = torch.randn(
-                [1, num_noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-            )
-            num_latent_frames = args.num_output_frames  # 总 latent 帧数 = noise
-
+        assert num_noise_frames % block_size == 0, (
+            f"[I2V] num_output_frames={num_noise_frames} 必须能被 num_frame_per_block={block_size} 整除")
+        initial_latent = None  # 不传 initial_latent，所有帧由模型去噪生成
+        sampled_noise = torch.randn(
+            [1, num_noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+        )
+        
         # I2V: 编码 CLIP 条件并构造 y
         clip_fea = None
         y_cond = None
@@ -208,7 +185,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             
             # 构造 y: 对齐 Wan2.1 I2V 官方实现
             # y = concat(mask[4ch], image_latent[16ch]) = 20ch
-            # y 的帧数 = num_latent_frames（方案A: initial+noise, 方案B: noise）
+            num_latent_frames = num_noise_frames  # 与噪声帧数一致（21帧）
             F = (num_latent_frames - 1) * 4 + 1  # 像素帧数
             lat_h, lat_w = 60, 104
             H_pixel, W_pixel = lat_h * 8, lat_w * 8

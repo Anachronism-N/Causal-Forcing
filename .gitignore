@@ -5,5 +5,10 @@ wan_models
 checkpoints
 output
 outputs
+outputs_old
 dataset
 prompts/vidprom_filtered_extended.txt
+migrate_outputs.sh
+migrate_outputs.log
+setup_symlinks.sh
+*.pyc

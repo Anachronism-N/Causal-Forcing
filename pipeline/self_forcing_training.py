@@ -3,6 +3,16 @@ from utils.scheduler import SchedulerInterface
 from typing import List, Optional
 import torch
 import torch.distributed as dist
+import os
+import time
+
+
+def debug_log(message, rank=None):
+    resolved_rank = os.environ.get("RANK", "?") if rank is None else rank
+    print(
+        f"[{time.strftime('%F %T')}] [self_forcing pid={os.getpid()} rank={resolved_rank}] {message}",
+        flush=True,
+    )
 
 
 class SelfForcingTrainingPipeline:
@@ -70,7 +80,8 @@ class SelfForcingTrainingPipeline:
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
-            assert num_frames % self.num_frame_per_block == 0
+            assert num_frames % self.num_frame_per_block == 0, \
+                f"num_frames={num_frames} 不能被 num_frame_per_block={self.num_frame_per_block} 整除"
             num_blocks = num_frames // self.num_frame_per_block
         else:
             # Using a [1, 4, 4, 4, 4, 4, ...] model to generate a video without image conditioning
@@ -78,6 +89,19 @@ class SelfForcingTrainingPipeline:
             num_blocks = (num_frames - 1) // self.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
+
+        # 首次调用时打印关键信息
+        if not hasattr(self, '_logged_first_call'):
+            self._logged_first_call = True
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                debug_log(f"[inference_with_trajectory 首次调用] "
+                          f"noise={list(noise.shape)}, "
+                          f"initial_latent={'None' if initial_latent is None else list(initial_latent.shape)}, "
+                          f"num_blocks={num_blocks}, num_frame_per_block={self.num_frame_per_block}, "
+                          f"independent_first_frame={self.independent_first_frame}, "
+                          f"num_input_frames={num_input_frames}, num_output_frames={num_output_frames}")
+
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
             device=noise.device,

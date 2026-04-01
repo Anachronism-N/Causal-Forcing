@@ -1,8 +1,9 @@
-# Stage 2: Causal ODE Distillation (I2V)
-# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V)
+# Stage 2 Step B: Causal ODE Distillation (I2V) - 方案 A
+# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V, independent_first_frame=True)
 # 学生 = CausalWanModel (目标: 少步)
-# 输入: ODE trajectory pairs (预计算)
-generator_ckpt: outputs/stage1_i2v/checkpoint_model_003000/model.pt
+# 输入: ODE trajectory pairs (预计算，从 .pt 转换为 LMDB)
+# 方案 A: independent_first_frame=True, num_frame_per_block=4
+generator_ckpt: outputs/stage1_i2v_plan_a/checkpoint_model_002000/model.pt
 generator_grad:
   model: true
 denoising_step_list:
@@ -25,9 +26,10 @@ batch_size: 1
 log_iters: 1000
 trainer: ode
 gradient_checkpointing: true
-num_frame_per_block: 3
+num_frame_per_block: 4
 # I2V 特有配置
 i2v: true
+independent_first_frame: true
 model_kwargs:
   model_name: Wan2.1-Fun-1.3B-InP
   timestep_shift: 5.0

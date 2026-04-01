@@ -310,6 +310,11 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
+            if self.is_main_process and self.step == 0:
+                debug_log(f"[首次 generator_loss] image_or_video_shape={image_or_video_shape}, "
+                          f"initial_latent shape={image_latent.shape if image_latent is not None else None}, "
+                          f"has clip_fea={conditional_dict.get('clip_fea') is not None}, "
+                          f"has y={conditional_dict.get('y') is not None}")
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
@@ -350,27 +355,47 @@ class Trainer:
 
     def train(self):
         start_step = self.step
-       
+
+        # 训练开始时打印关键配置信息
+        if self.is_main_process:
+            debug_log("========== Stage3 DMD 训练配置 ==========")
+            debug_log(f"  i2v={getattr(self.config, 'i2v', False)}")
+            debug_log(f"  independent_first_frame={getattr(self.config, 'independent_first_frame', False)}")
+            debug_log(f"  num_frame_per_block={getattr(self.config, 'num_frame_per_block', 1)}")
+            debug_log(f"  num_training_frames={getattr(self.config, 'num_training_frames', 21)}")
+            debug_log(f"  image_or_video_shape={list(self.config.image_or_video_shape)}")
+            debug_log(f"  denoising_step_list={list(self.config.denoising_step_list)}")
+            debug_log(f"  generator_ckpt={getattr(self.config, 'generator_ckpt', 'N/A')}")
+            debug_log(f"  real_name={getattr(self.config, 'real_name', 'N/A')}")
+            debug_log(f"  fake_name={getattr(self.config, 'fake_name', 'N/A')}")
+            debug_log(f"  lr={self.config.lr}, lr_critic={getattr(self.config, 'lr_critic', 'N/A')}")
+            debug_log(f"  dfake_gen_update_ratio={self.config.dfake_gen_update_ratio}")
+            debug_log(f"  max_iters={self.max_iters}, log_iters={self.config.log_iters}")
+            debug_log(f"  ema_weight={self.config.ema_weight}, ema_start_step={self.config.ema_start_step}")
+            debug_log("=========================================")
+
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            step_start_time = time.time()
 
             # Train the generator
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 
                 batch = next(self.dataloader)
+                if self.is_main_process and self.step % 10 == 0:
+                    debug_log(f"[step {self.step}] 开始 generator 前向+反向")
                 generator_log_dict = self.fwdbwd_one_step(batch, True)
 
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
-                
-                
-                
 
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
             batch = next(self.dataloader)
+            if self.is_main_process and self.step % 10 == 0:
+                debug_log(f"[step {self.step}] 开始 critic 前向+反向")
             critic_log_dict = self.fwdbwd_one_step(batch, False)
                 
             self.critic_optimizer.step()
@@ -382,6 +407,8 @@ class Trainer:
             if (self.step >= self.config.ema_start_step) and \
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+                if self.is_main_process:
+                    debug_log(f"[step {self.step}] EMA 已初始化, decay={self.config.ema_weight}")
 
             # Save the model
             if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
@@ -390,23 +417,41 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
+            step_elapsed = time.time() - step_start_time
             if self.is_main_process:
                 wandb_loss_dict = {}
+                log_parts = [f"[step {self.step}/{self.max_iters}]"]
                 if TRAIN_GENERATOR:
+                    g_loss = generator_log_dict["generator_loss"].mean().item()
+                    g_grad = generator_log_dict["generator_grad_norm"].mean().item()
+                    g_dmd_grad = generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                     wandb_loss_dict.update(
                         {
-                            "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
+                            "generator_loss": g_loss,
+                            "generator_grad_norm": g_grad,
+                            "dmdtrain_gradient_norm": g_dmd_grad
                         }
                     )
+                    log_parts.append(f"g_loss={g_loss:.6f} g_grad={g_grad:.4f} dmd_grad={g_dmd_grad:.6f}")
 
+                c_loss = critic_log_dict["critic_loss"].mean().item()
+                c_grad = critic_log_dict["critic_grad_norm"].mean().item()
                 wandb_loss_dict.update(
                     {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        "critic_loss": c_loss,
+                        "critic_grad_norm": c_grad
                     }
                 )
+                log_parts.append(f"c_loss={c_loss:.6f} c_grad={c_grad:.4f}")
+                log_parts.append(f"time={step_elapsed:.2f}s")
+
+                # 每10步打印 GPU 显存使用情况
+                if self.step % 10 == 0:
+                    mem_alloc = torch.cuda.max_memory_allocated() / 1024**3
+                    mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                    log_parts.append(f"gpu_mem={mem_alloc:.1f}G/{mem_reserved:.1f}G")
+
+                debug_log(" | ".join(log_parts))
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
@@ -427,6 +472,8 @@ class Trainer:
                     self.previous_time = current_time
 
             if self.max_iters is not None and self.step >= self.max_iters:
+                if self.is_main_process:
+                    debug_log(f"达到 max_iters={self.max_iters}，训练结束")
                 should_save_final = (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters != 0
                 if should_save_final:
                     torch.cuda.empty_cache()

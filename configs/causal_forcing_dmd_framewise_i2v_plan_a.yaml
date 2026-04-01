@@ -1,9 +1,16 @@
-# Stage 3 (Alternative): Causal Consistency Distillation (I2V) - 方案 B
-# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V)
-# 学生 = CausalWanModel (目标: 少步)
-# 方案 B: independent_first_frame=false, num_frame_per_block=3
-# 分块方式: [3, 3, 3, 3, 3, 3, 3] = 3*7 = 21 帧
-generator_ckpt: outputs/stage1_i2v_block3/checkpoint_model_003000/model.pt
+# Stage 3: Causal DMD Distillation (I2V) - 方案 A
+# 教师 (real_score) = Wan2.1-I2V-14B-720P (非 causal，冻结)
+# 学生 (generator) = Stage 2 ODE 蒸馏产出的 CausalWanModel (1.3B I2V, independent_first_frame=True)
+# 判别器 (fake_score) = Wan2.1-Fun-1.3B-InP (非 causal，可训练)
+# 方案 A: independent_first_frame=true, num_frame_per_block=4
+# 分块方式: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧
+independent_first_frame: true
+generator_ckpt: outputs/stage2_ode_i2v_plan_a/checkpoint_model_003000/model.pt
+generator_grad:
+  model: true
+# 教师和判别器模型名称
+real_name: Wan2.1-I2V-14B-720P
+fake_name: Wan2.1-Fun-1.3B-InP
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -33,7 +40,8 @@ batch_size: 1
 ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 8
-log_iters: 1000
+log_iters: 100
+max_iters: 500
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 dfake_gen_update_ratio: 5
 image_or_video_shape:
@@ -43,19 +51,18 @@ image_or_video_shape:
 - 60
 - 104
 distribution_loss: dmd
-trainer: consistency_distillation
+trainer: score_distillation
 gradient_checkpointing: true
-num_frame_per_block: 3
+num_frame_per_block: 4
 load_raw_video: false
 # I2V 特有配置
 i2v: true
 causal: true
-is_causal: true
-discrete_cd_N: 48
 model_kwargs:
   model_name: Wan2.1-Fun-1.3B-InP
   timestep_shift: 5.0
 data_path: /apdcephfs/wx_feature/home/cedricnie/data/lmdb_1219
-grad_accum: 1
-spatial_sf: true
-teacher_forcing: true
+# 方案 A 说明：
+# independent_first_frame=true + num_frame_per_block=4
+# 训练分块: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧
+# generator 从 Stage2 方案 A 的 ODE 蒸馏权重初始化

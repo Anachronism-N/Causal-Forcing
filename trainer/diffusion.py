@@ -259,6 +259,10 @@ class Trainer:
             print(f"[train_one_step] step={self.step}, conditions encoded, starting generator forward...", flush=True)
 
         # Step 3: Train the generator
+        # 方案 A (independent_first_frame=True): clean_latent 保持完整 21 帧
+        #   _get_timestep 会为首帧分配独立 timestep，后续 20 帧按 block_size=4 分组
+        #   initial_latent（首帧）通过 conditional_dict 传入模型
+        # 方案 B (independent_first_frame=False): clean_latent 保持原样（21 帧）
         generator_loss, log_dict = self.model.generator_loss(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,

@@ -120,6 +120,9 @@ def main():
         fixed[k] = v
     state_dict = fixed
     model.model.load_state_dict(state_dict, strict=True)
+    # 确保加载 checkpoint 后所有参数统一为 float32
+    # （混合精度训练保存的 checkpoint 可能包含 float16 权重）
+    model = model.to(torch.float32)
 
     dataset = LatentLMDBDataset(args.rawdata_path)
 
@@ -129,7 +132,7 @@ def main():
     total_steps = int(math.ceil(len(dataset) / dist.get_world_size()))
     image_or_video_shape = [1, 21, 16, 60, 104]
 
-    for index in tqdm(total_steps, disable=(dist.get_rank() != 0)):
+    for index in tqdm(range(total_steps), disable=(dist.get_rank() != 0)):
         prompt_index = index * dist.get_world_size() + dist.get_rank()
         if prompt_index >= len(dataset):
             continue
@@ -149,9 +152,9 @@ def main():
             clip_encoder, vae, ref_image, image_or_video_shape, device)
         conditional_dict["clip_fea"] = clip_fea
         conditional_dict["y"] = y_list
-        unconditional_dict_with_i2v = {**unconditional_dict}
-        unconditional_dict_with_i2v["clip_fea"] = clip_fea
-        unconditional_dict_with_i2v["y"] = y_list
+        # I2V: 无条件分支也必须包含 clip_fea 和 y，否则 CFG 的无条件预测缺少图像条件
+        unconditional_dict["clip_fea"] = clip_fea
+        unconditional_dict["y"] = y_list
 
         # ODE sampling
         latents = torch.randn(
@@ -167,7 +170,7 @@ def main():
                 latents, conditional_dict, timestep, clean_x=clean_latent)
 
             f_uncond, x0_pred_uncond = model(
-                latents, unconditional_dict_with_i2v, timestep, clean_x=clean_latent)
+                latents, unconditional_dict, timestep, clean_x=clean_latent)
 
             flow_pred = f_uncond + args.guidance_scale * (f_cond - f_uncond)
 

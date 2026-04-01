@@ -658,6 +658,122 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         return block_mask
 
     @staticmethod
+    def _prepare_teacher_forcing_mask_i2v(
+        device: torch.device | str, num_frames: int = 21,
+        frame_seqlen: int = 1560, num_frame_per_block=4
+    ) -> BlockMask:
+        """
+        Teacher Forcing mask for independent_first_frame=True (方案 A).
+        
+        序列结构: [clean_frames(21帧) | noisy_frames(21帧)]
+        分块方式: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧
+        
+        Clean 部分:
+          - 首帧 clean: 只看自身
+          - 第 k 个 block 的 clean: 看首帧 clean + 前 k 个 block 的 clean（含自身）
+        
+        Noisy 部分:
+          - 首帧 noisy: 看首帧 clean + 自身
+          - 第 k 个 block 的 noisy: 看首帧 clean + 前 k-1 个 block 的 clean + 自身 block 的 noisy
+            (注意: noisy 不看自身 block 对应的 clean，因为 TF 中 noisy 只看 "之前" 的 clean 上下文)
+        """
+        DEBUG = False
+        if DEBUG:
+            num_frames = 10  # 1 + 3*3
+            frame_seqlen = 256
+
+        total_length = num_frames * frame_seqlen * 2
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        clean_ends = num_frames * frame_seqlen
+        first_frame_size = frame_seqlen  # 首帧独立
+        block_size = frame_seqlen * num_frame_per_block  # 后续每个 block 的大小
+
+        # --- Clean 部分的 attention 范围 ---
+        context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        
+        # 首帧 clean: 只看自身 [0, first_frame_size)
+        context_ends[:first_frame_size] = first_frame_size
+        
+        # 后续 block 的 clean: 看首帧 + 前面所有 block（含自身）
+        block_starts = torch.arange(
+            first_frame_size, clean_ends, block_size, device=device, dtype=torch.long
+        )
+        for start in block_starts:
+            end = min(start + block_size, clean_ends)
+            context_ends[start:end] = end
+
+        # --- Noisy 部分的 attention 范围 ---
+        noise_context_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_noise_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_noise_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+
+        noisy_start = clean_ends  # noisy 部分的起始位置
+
+        # 首帧 noisy: 看首帧 clean [0, first_frame_size) + 自身
+        noisy_first_start = noisy_start
+        noisy_first_end = noisy_start + first_frame_size
+        noise_noise_starts[noisy_first_start:noisy_first_end] = noisy_first_start
+        noise_noise_ends[noisy_first_start:noisy_first_end] = noisy_first_end
+        # 首帧 noisy 看首帧 clean
+        noise_context_starts[noisy_first_start:noisy_first_end] = 0
+        noise_context_ends[noisy_first_start:noisy_first_end] = first_frame_size
+
+        # 后续 block 的 noisy
+        noisy_block_starts = torch.arange(
+            noisy_start + first_frame_size, total_length, block_size,
+            device=device, dtype=torch.long
+        )
+        for block_idx, nbs in enumerate(noisy_block_starts):
+            nbe = nbs + block_size
+            # 自身 block 的 noisy tokens
+            noise_noise_starts[nbs:nbe] = nbs
+            noise_noise_ends[nbs:nbe] = nbe
+            # 看 clean 部分: 首帧 + 前 block_idx 个 block（不含自身 block 对应的 clean）
+            # clean 范围: [0, first_frame_size + block_idx * block_size)
+            noise_context_starts[nbs:nbe] = 0
+            noise_context_ends[nbs:nbe] = first_frame_size + block_idx * block_size
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            # Clean 部分: 只看 clean 范围内的 token
+            clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
+            # Noisy 部分: 看对应的 clean 上下文 + 自身 block 的 noisy
+            C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
+            C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
+            noise_mask = (q_idx >= clean_ends) & (C1 | C2)
+
+            eye_mask = q_idx == kv_idx
+            return eye_mask | clean_mask | noise_mask
+
+        block_mask = create_block_mask(
+            attention_mask, B=None, H=None,
+            Q_LEN=total_length + padded_length,
+            KV_LEN=total_length + padded_length,
+            _compile=False, device=device
+        )
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(
+                f" [TF-I2V] cached teacher forcing mask with independent_first_frame, "
+                f"num_frames={num_frames}, block_size={num_frame_per_block}")
+            print(block_mask)
+
+        if DEBUG:
+            import imageio
+            import numpy as np
+            from torch.nn.attention.flex_attention import create_mask
+            mask = create_mask(
+                attention_mask, B=None, H=None,
+                Q_LEN=total_length + padded_length,
+                KV_LEN=total_length + padded_length, device=device)
+            import cv2
+            mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
+            imageio.imwrite("mask_tf_i2v.jpg", np.uint8(255. * mask))
+
+        return block_mask
+
+    @staticmethod
     def _prepare_blockwise_causal_attn_mask_i2v(
         device: torch.device | str, num_frames: int = 21,
         frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1
@@ -773,7 +889,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 num_frames_x = u_x.shape[1]  # x: [C, F, H, W]
                 num_frames_y = u_y.shape[1]  # y: [C_y, F, H, W]
                 if num_frames_y > num_frames_x:
-                    u_y = u_y[:, current_frame_idx:current_frame_idx + num_frames_x]
+                    # I2V 模式下，initial_latent 会使 current_frame_idx 偏移，
+                    # 导致最后一个 block 切片可能越界（y 只有 21 帧但需要 y[:, 19:22]）。
+                    # y 的 I2V 条件在第 1 帧之后本来就全是零，所以零填充在语义上是正确的。
+                    end_idx = current_frame_idx + num_frames_x
+                    if end_idx <= num_frames_y:
+                        u_y = u_y[:, current_frame_idx:end_idx]
+                    else:
+                        # 切片越界：取能取到的部分，剩余用零填充
+                        available = u_y[:, current_frame_idx:num_frames_y]
+                        pad_frames = end_idx - num_frames_y
+                        padding = torch.zeros(
+                            u_y.shape[0], pad_frames, *u_y.shape[2:],
+                            device=u_y.device, dtype=u_y.dtype)
+                        u_y = torch.cat([available, padding], dim=1)
                 y_sliced.append(u_y)
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y_sliced)]
 
@@ -905,7 +1034,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.block_mask is None:
             if clean_x is not None: # TF
                 if self.independent_first_frame:
-                    raise NotImplementedError()
+                    self.block_mask = self._prepare_teacher_forcing_mask_i2v(
+                        device, num_frames=x.shape[2],
+                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        num_frame_per_block=self.num_frame_per_block
+                    )
                 else:
                     self.block_mask = self._prepare_teacher_forcing_mask(
                         device, num_frames=x.shape[2],
@@ -963,6 +1096,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ]))
 
         if clip_fea is not None:
+            # 对齐 dtype，避免混合精度下 clip_fea 与 img_emb 权重 dtype 不一致
+            clip_fea = clip_fea.to(dtype=next(self.img_emb.parameters()).dtype)
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 

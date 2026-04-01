@@ -4,10 +4,20 @@ from torch import nn
 import torch.distributed as dist
 import torch
 import torch.nn.functional as TF_func
+import os
+import time
 
 from pipeline import SelfForcingTrainingPipeline,TeacherForcingTrainingPipeline,BidirectionalTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder
+
+
+def debug_log(message, rank=None):
+    resolved_rank = os.environ.get("RANK", "?") if rank is None else rank
+    print(
+        f"[{time.strftime('%F %T')}] [base pid={os.getpid()} rank={resolved_rank}] {message}",
+        flush=True,
+    )
 
 
 class BaseModel(nn.Module):
@@ -216,6 +226,19 @@ class SelfForcingModel(BaseModel):
             noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
         else:
             noise_shape = image_or_video_shape.copy()
+
+        # 首次调用时打印关键信息
+        if not hasattr(self, '_logged_run_generator'):
+            self._logged_run_generator = True
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                debug_log(f"[_run_generator 首次调用] "
+                          f"i2v={self.args.i2v}, independent_first_frame={self.args.independent_first_frame}, "
+                          f"num_frame_per_block={self.num_frame_per_block}, "
+                          f"num_training_frames={self.num_training_frames}, "
+                          f"image_or_video_shape={image_or_video_shape}, "
+                          f"noise_shape={noise_shape}, "
+                          f"initial_latent={'None' if initial_latent is None else list(initial_latent.shape)}")
 
         # During training, the number of generated frames should be uniformly sampled from
         # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block

@@ -17,6 +17,15 @@ class CausalDiffusion(BaseModel):
         self.independent_first_frame = getattr(args, "independent_first_frame", False)
         if self.independent_first_frame:
             self.generator.model.independent_first_frame = True
+            # 方案 A: independent_first_frame=True, num_frame_per_block=4
+            # 分块: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧
+            # seq_len = num_frames * (H/patch_h * W/patch_w)
+            if hasattr(args, "image_or_video_shape"):
+                shape = args.image_or_video_shape  # [B, F, C, H, W]
+                num_frames = shape[1]
+                patch_size = self.generator.model.patch_size  # [t, h, w]
+                frame_seqlen = (shape[3] // patch_size[1]) * (shape[4] // patch_size[2])
+                self.generator.seq_len = num_frames * frame_seqlen
 
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
@@ -80,15 +89,20 @@ class CausalDiffusion(BaseModel):
             - loss: a scalar tensor representing the generator loss.
             - generator_log_dict: a dictionary containing the intermediate tensors for logging.
         """
+        # 方案 A: independent_first_frame=True 时，首帧通过 conditional_dict 传入
+        # clean_latent 包含完整 21 帧（首帧 + 20 帧），_get_timestep 会为首帧分配独立 timestep
+        if initial_latent is not None:
+            conditional_dict["initial_latent"] = initial_latent
+
         noise = torch.randn_like(clean_latent)
-        batch_size, num_frame = image_or_video_shape[:2]
+        batch_size, num_frame = clean_latent.shape[0], clean_latent.shape[1]
 
         # Step 2: Randomly sample a timestep and add noise to denoiser inputs
         index = self._get_timestep(
             0,
             self.scheduler.num_train_timesteps,
-            image_or_video_shape[0],
-            image_or_video_shape[1],
+            batch_size,
+            num_frame,
             self.num_frame_per_block,
             uniform_timestep=False
         )
@@ -105,8 +119,8 @@ class CausalDiffusion(BaseModel):
             index_clean_aug = self._get_timestep(
                 self.noise_augmentation_max_timestep,
                 1000,
-                image_or_video_shape[0],
-                image_or_video_shape[1],
+                batch_size,
+                num_frame,
                 self.num_frame_per_block,
                 uniform_timestep=False
             )

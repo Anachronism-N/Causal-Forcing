@@ -16,6 +16,14 @@ import os
 from utils.distributed import barrier, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 
 
+def debug_log(message, rank=None):
+    resolved_rank = os.environ.get("RANK", "?") if rank is None else rank
+    print(
+        f"[{time.strftime('%F %T')}] [ode pid={os.getpid()} rank={resolved_rank}] {message}",
+        flush=True,
+    )
+
+
 class Trainer:
     def __init__(self, config):
         self.config = config
@@ -227,13 +235,27 @@ class Trainer:
         self.generator_optimizer.step()
 
         # Step 4: Logging
-        if self.is_main_process and not self.disable_wandb:
-            wandb_loss_dict = {
-                "generator_loss": generator_loss.item(),
-                "generator_grad_norm": generator_grad_norm.item(),
-                **stats
-            }
-            wandb.log(wandb_loss_dict, step=self.step)
+        if self.is_main_process:
+            log_parts = [f"[step {self.step}]"]
+            log_parts.append(f"loss={generator_loss.item():.6f}")
+            log_parts.append(f"grad={generator_grad_norm.item():.4f}")
+            # 添加各时间步的 loss 分解
+            for key_t in sorted(stats.keys()):
+                log_parts.append(f"{key_t}={stats[key_t]:.6f}")
+            # 每10步打印 GPU 显存
+            if self.step % 10 == 0:
+                mem_alloc = torch.cuda.max_memory_allocated() / 1024**3
+                mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                log_parts.append(f"gpu_mem={mem_alloc:.1f}G/{mem_reserved:.1f}G")
+            debug_log(" | ".join(log_parts))
+
+            if not self.disable_wandb:
+                wandb_loss_dict = {
+                    "generator_loss": generator_loss.item(),
+                    "generator_grad_norm": generator_grad_norm.item(),
+                    **stats
+                }
+                wandb.log(wandb_loss_dict, step=self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -241,6 +263,17 @@ class Trainer:
             gc.collect()
 
     def train(self):
+        # 训练开始时打印关键配置信息
+        if self.is_main_process:
+            debug_log("========== Stage2 ODE 训练配置 ==========")
+            debug_log(f"  i2v={getattr(self.config, 'i2v', False)}")
+            debug_log(f"  num_frame_per_block={getattr(self.config, 'num_frame_per_block', 1)}")
+            debug_log(f"  independent_first_frame={getattr(self.config, 'independent_first_frame', False)}")
+            debug_log(f"  denoising_step_list={list(self.config.denoising_step_list)}")
+            debug_log(f"  lr={self.config.lr}")
+            debug_log(f"  data_path={self.config.data_path}")
+            debug_log(f"  log_iters={self.config.log_iters}")
+            debug_log("=========================================")
 
         while True:
             self.train_one_step()

@@ -1,9 +1,10 @@
-# Stage 3 (Alternative): Causal Consistency Distillation (I2V) - 方案 B
-# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V)
+# Stage 3 (Alternative): Causal Consistency Distillation (I2V) - 方案 A
+# 教师 = Stage 1 产出的 AR Diffusion 模型 (causal, I2V, independent_first_frame=True)
 # 学生 = CausalWanModel (目标: 少步)
-# 方案 B: independent_first_frame=false, num_frame_per_block=3
-# 分块方式: [3, 3, 3, 3, 3, 3, 3] = 3*7 = 21 帧
-generator_ckpt: outputs/stage1_i2v_block3/checkpoint_model_003000/model.pt
+# 方案 A: independent_first_frame=true, num_frame_per_block=4
+# 分块方式: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧
+independent_first_frame: true
+generator_ckpt: outputs/stage1_i2v_plan_a/checkpoint_model_002000/model.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -45,7 +46,7 @@ image_or_video_shape:
 distribution_loss: dmd
 trainer: consistency_distillation
 gradient_checkpointing: true
-num_frame_per_block: 3
+num_frame_per_block: 4
 load_raw_video: false
 # I2V 特有配置
 i2v: true
@@ -59,3 +60,6 @@ data_path: /apdcephfs/wx_feature/home/cedricnie/data/lmdb_1219
 grad_accum: 1
 spatial_sf: true
 teacher_forcing: true
+# 方案 A 说明：
+# independent_first_frame=true + num_frame_per_block=4
+# 训练分块: [1, 4, 4, 4, 4, 4] = 1 + 4*5 = 21 帧

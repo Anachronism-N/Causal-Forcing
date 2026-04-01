@@ -16,16 +16,21 @@ class ODERegression(BaseModel):
         See Sec 4.3 of CausVid https://arxiv.org/abs/2412.07772 for details
         """
         super().__init__(args, device)
-        # Step 1: Initialize all models
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
-        self.generator.model.requires_grad_(True)
-        if getattr(args, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
-                'generator']
-            self.generator.load_state_dict(
-                state_dict, strict=True
-            )
+        # 注意：generator 已在 _initialize_models() 中创建，此处不再重复创建
+        # 以下代码被注释以避免 generator 被创建两次、权重被加载两次的冗余问题
+        # 最终权重加载由 trainer/ode.py 中的 load_state_dict 完成
+        # ---- 原始代码（已注释）----
+        # # Step 1: Initialize all models
+        # self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        # self.generator.model.requires_grad_(True)
+        # if getattr(args, "generator_ckpt", False):
+        #     print(f"Loading pretrained generator from {args.generator_ckpt}")
+        #     state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
+        #         'generator']
+        #     self.generator.load_state_dict(
+        #         state_dict, strict=True
+        #     )
+        # ---- 原始代码结束 ----
 
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
 
