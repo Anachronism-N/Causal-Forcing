@@ -30,7 +30,7 @@ data_path: /apdcephfs/wx_feature/home/cedricnie/data/lmdb_1219
 i2v: true
 batch_size: 1
 ema_weight: 0.99
-ema_start_step: 200
+ema_start_step: 999999
 total_batch_size: 8
 log_iters: 100
 max_iters: 500
@@ -45,8 +45,10 @@ image_or_video_shape:
 distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
-num_frame_per_block: 3
+num_frame_per_block: 4
 load_raw_video: false
+causal: true
+independent_first_frame: true
 model_kwargs:
   model_name: Wan2.1-Fun-1.3B-InP
   timestep_shift: 5.0

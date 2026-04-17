@@ -222,9 +222,11 @@ class SelfForcingModel(BaseModel):
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
-        if self.args.i2v:
+        if self.args.i2v and self.args.independent_first_frame:
+            # 方案 A: initial_latent 占 1 帧，noise 帧数 = 总帧数 - 1
             noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
         else:
+            # T2V 或 方案 B (i2v 但不使用 initial_latent): noise 帧数 = 总帧数
             noise_shape = image_or_video_shape.copy()
 
         # 首次调用时打印关键信息
@@ -372,7 +374,8 @@ class TeacherForcingModel(BaseModel):
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
         if initial_latent is not None: # never met
             conditional_dict["initial_latent"] = initial_latent
-        if self.args.i2v: # never met
+        if self.args.i2v and self.args.independent_first_frame: # never met
+            # 方案 A: initial_latent 占 1 帧，noise 帧数 = 总帧数 - 1
             noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
         else:
             noise_shape = image_or_video_shape.copy()
@@ -512,7 +515,8 @@ class BidirectionalModel(BaseModel):
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
         if initial_latent is not None: # never met
             conditional_dict["initial_latent"] = initial_latent
-        if self.args.i2v: # never met
+        if self.args.i2v and self.args.independent_first_frame: # never met
+            # 方案 A: initial_latent 占 1 帧，noise 帧数 = 总帧数 - 1
             noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
         else:
             noise_shape = image_or_video_shape.copy()

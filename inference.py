@@ -68,6 +68,17 @@ else:
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
     key = 'generator_ema' if args.use_ema else 'generator'
+    # 自动 fallback：如果指定的 key 不存在，尝试另一个 key
+    if key not in state_dict:
+        fallback_key = 'generator' if key == 'generator_ema' else 'generator_ema'
+        if fallback_key in state_dict:
+            print(f"[WARNING] Key '{key}' not found in checkpoint, falling back to '{fallback_key}'")
+            key = fallback_key
+        elif 'model' in state_dict:
+            print(f"[WARNING] Key '{key}' not found in checkpoint, falling back to 'model'")
+            key = 'model'
+        else:
+            raise KeyError(f"Checkpoint does not contain '{key}' or any known fallback key. Available keys: {list(state_dict.keys())}")
     gen_sd = state_dict[key]
 
     try:

@@ -192,14 +192,13 @@ class Trainer:
         generator_state_dict = fsdp_state_dict(
             self.model.generator)
 
-        if self.config.ema_start_step < self.step:
-            state_dict = {
-                "generator_ema": self.generator_ema.state_dict(),
-            }
-        else:
-            state_dict = {
-                "generator": generator_state_dict,
-            }
+        # 始终保存 generator 原始权重
+        state_dict = {
+            "generator": generator_state_dict,
+        }
+        # 如果 EMA 已初始化且达到启用步数，同时保存 EMA 权重
+        if self.generator_ema is not None and self.config.ema_start_step < self.step:
+            state_dict["generator_ema"] = self.generator_ema.state_dict()
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
